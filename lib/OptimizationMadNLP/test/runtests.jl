@@ -19,7 +19,7 @@ using Random
         (x, p) -> -rosenbrock(x, p), ad)
     prob = OptimizationProblem(optfunc, x0, _p; sense = OptimizationBase.MaxSense)
 
-    sol = solve(prob, MadNLPOptimizer(), verbose = true)
+    sol = solve(prob, MadNLPOptimizer(), verbose = false, progress=true)
 
     @test sol ≈ [1, 1]
 end

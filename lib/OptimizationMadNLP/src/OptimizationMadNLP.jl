@@ -8,9 +8,15 @@ using SparseArrays
 
 export MadNLPOptimizer
 
+struct MadNLPCallback{C}
+    progress::Bool
+    callback::C
+end
+
 struct NLPModelsAdaptor{C, T, HB} <: NLPModels.AbstractNLPModel{T, Vector{T}}
     cache::C
     meta::NLPModels.NLPModelMeta{T, Vector{T}}
+    callback::MadNLPCallback
     counters::NLPModels.Counters
     jac_rows::Vector{Int}
     jac_cols::Vector{Int}
@@ -51,7 +57,7 @@ function _enumerate_lower_triangle(n)
 end
 
 function NLPModelsAdaptor(
-        cache::C, meta::NLPModels.NLPModelMeta{T, Vector{T}}, counters) where {C, T}
+        cache::C, meta::NLPModels.NLPModelMeta{T, Vector{T}}, cb::MadNLPCallback, counters) where {C, T}
     # Extract Jacobian structure once
     jac_prototype = cache.f.cons_jac_prototype
 
@@ -95,7 +101,7 @@ function NLPModelsAdaptor(
         hess_buffer = zeros(T, n, n)
     end
 
-    return NLPModelsAdaptor{C, T, typeof(hess_buffer)}(cache, meta, counters,
+    return NLPModelsAdaptor{C, T, typeof(hess_buffer)}(cache, meta, cb, counters,
         jac_rows, jac_cols, jac_buffer,
         hess_rows, hess_cols, hess_buffer)
 end
@@ -210,6 +216,37 @@ function NLPModels.jprod!(
         nlp.cache.f.cons_jvp(Jv, x, v)
     end
     return Jv
+end
+
+function (cb::MadNLPCallback)(solver::MadNLP.AbstractMadNLPSolver)
+    iter = solver.cnt.k
+    u = MadNLP.full(solver.x)
+
+    obj_scale = solver.cb.obj_scale[]
+    objective = solver.obj_val/obj_scale
+
+    opt_state = OptimizationBase.OptimizationState(; iter, u, objective, original=solver)
+
+    if cb.progress
+        maxiters = solver.opt.max_iter
+        msg = "objective: " *
+              sprint(show, objective, context = :compact => true)
+        if !isnothing(maxiters)
+            # we stop at either convergence or max_steps
+            Base.@logmsg(Base.LogLevel(-1), msg, progress=iter / maxiters,
+                _id=:OptimizationMadNLP)
+        end
+    end
+
+    if !isnothing(cb.callback)
+        cb.callback(opt_state, objective)
+    else
+        false
+    end
+end
+
+function MadNLP.user_callback_termination(nlp::NLPModelsAdaptor, solver::MadNLP.AbstractMadNLPSolver)
+    nlp.callback(solver)
 end
 
 @kwdef struct MadNLPOptimizer{T}
@@ -374,6 +411,8 @@ function __map_optimizer_args(cache,
         print_level = verbose
     end
 
+    cb = MadNLPCallback(progress, callback)
+
     !isnothing(reltol) && @warn "reltol not supported by MadNLP."
     tol = isnothing(abstol) ? 1e-8 : abstol
     max_iter = isnothing(maxiters) ? 3000 : maxiters
@@ -416,14 +455,14 @@ function __map_optimizer_args(cache,
     options[:max_iter] = max_iter
     options[:max_wall_time] = max_wall_time
 
-    meta, options
+    meta, cb, options
 end
 
 function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: MadNLPOptimizer}
     maxiters = OptimizationBase._check_and_convert_maxiters(cache.solver_args.maxiters)
     maxtime = OptimizationBase._check_and_convert_maxtime(cache.solver_args.maxtime)
 
-    meta, options = __map_optimizer_args(cache,
+    meta, cb, options = __map_optimizer_args(cache,
         cache.opt;
         abstol = cache.solver_args.abstol,
         reltol = cache.solver_args.reltol,
@@ -434,7 +473,7 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: MadNLPOptimi
         callback = cache.callback
     )
 
-    nlp = NLPModelsAdaptor(cache, meta, NLPModels.Counters())
+    nlp = NLPModelsAdaptor(cache, meta, cb, NLPModels.Counters())
     solver = MadNLP.MadNLPSolver(nlp; options...)
     results = MadNLP.solve!(solver)
 
